@@ -6,11 +6,10 @@ from transformers import AutoTokenizer, AutoModel
 from torch.optim import AdamW
 import json
 import numpy as np
+import pandas as pd
 import os
-import csv
 import random
 from tqdm import tqdm
-import time
 
 # ==========================================
 # 1. Configuration
@@ -22,11 +21,10 @@ class Config:
     EPOCHS = 3
     LR = 2e-5
     TEMPERATURE = 0.05
-    DATA_PATH = "dataset.csv"  # Ensure this matches your actual filename
+    DATA_PATH = "dataset.csv" 
     CHECKPOINT_PATH = "sparsecl_checkpoint.pth"
-    SAVE_STEPS = 500  # Increased slightly since dataset is now larger
+    SAVE_STEPS = 500
     
-    # Auto-detect hardware
     DEVICE = torch.device("mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu"))
     SEED = 42
 
@@ -38,112 +36,62 @@ def set_seed(seed):
         torch.cuda.manual_seed_all(seed)
 
 # ==========================================
-# 2. Exploded Dataset (Utilizes ALL Contradictions)
+# 2. Robust Dataset (Pandas-based)
 # ==========================================
 class ExplodedCSVDataset(Dataset):
     def __init__(self, data_path):
-        self.data_path = data_path
-        # Each item in self.indices is a tuple: (file_offset_bytes, contradiction_index_in_json)
-        self.indices = [] 
-        self.col_map = {}
-        
-        print(f"--- INDEXING DATASET ({data_path}) ---")
+        print(f"--- LOADING DATASET ({data_path}) ---")
         if not os.path.exists(data_path):
             raise FileNotFoundError(f"File {data_path} not found!")
 
-        start_time = time.time()
+        # 1. Load data into RAM using Pandas (Handles multiline CSVs correctly)
+        df = pd.read_csv(data_path)
         
-        with open(data_path, 'rb') as f:
-            # 1. Parse Header
-            header_bytes = f.readline()
-            header_str = header_bytes.decode('utf-8').replace('\ufeff', '')
-            headers = next(csv.reader([header_str]))
-            self.col_map = {name.strip(): i for i, name in enumerate(headers)}
-            
-            # Verify columns
-            if 'contradictions' not in self.col_map:
-                raise ValueError("CSV missing 'contradictions' column")
-
-            col_idx_contra = self.col_map['contradictions']
-            col_idx_status = self.col_map.get('status_overall', -1)
-
-            # 2. Scan and Explode
-            row_count = 0
-            while True:
-                offset = f.tell()
-                line_bytes = f.readline()
-                if not line_bytes:
-                    break
+        # 2. Explode the dataset
+        self.samples = []
+        
+        print(f"Parsing {len(df)} rows...")
+        for _, row in tqdm(df.iterrows(), total=len(df)):
+            try:
+                # Basic fields
+                claim = row['claim']
+                paraphrase = row['paraphrase']
                 
-                row_count += 1
-                try:
-                    line_str = line_bytes.decode('utf-8')
-                    row_values = next(csv.reader([line_str]))
-                    
-                    # Safety check for truncated rows
-                    if len(row_values) <= col_idx_contra:
-                        continue
-
-                    # Check Status (Optional, based on your logic)
-                    if col_idx_status != -1:
-                        status = row_values[col_idx_status]
-                        if "invalid" in status:
-                            continue
-
-                    # Parse JSON Contradictions
-                    contradictions_json = row_values[col_idx_contra]
-                    contradictions = json.loads(contradictions_json)
-
-                    if isinstance(contradictions, list):
-                        # Add an index for EVERY valid contradiction in the list
-                        for i, contra in enumerate(contradictions):
-                            # Ensure it's not an empty string (failed generation)
-                            if contra and isinstance(contra, str) and len(contra.strip()) > 5:
-                                self.indices.append((offset, i))
-                                
-                except (json.JSONDecodeError, IndexError, ValueError):
-                    # Skip malformed lines silently during indexing
+                # Parse JSON
+                # Handle potential string/object discrepancies
+                contra_raw = row['contradictions']
+                if isinstance(contra_raw, str):
+                    contradictions = json.loads(contra_raw)
+                else:
+                    contradictions = contra_raw # Already list if pandas inferred it (rare for JSON)
+                
+                if not isinstance(contradictions, list):
                     continue
 
-        elapsed = time.time() - start_time
-        print(f"Scanned {row_count} raw CSV rows.")
-        print(f"Created {len(self.indices)} training samples (Exploded View).")
-        print(f"Indexing took {elapsed:.2f} seconds.")
+                # Create a sample for EACH valid contradiction
+                for contra in contradictions:
+                    if contra and isinstance(contra, str) and len(contra.strip()) > 5:
+                        self.samples.append({
+                            'anchor': claim,
+                            'positive': contra,
+                            'negative': paraphrase
+                        })
+                        
+            except Exception as e:
+                # Skip malformed rows
+                continue
+
+        print(f"✅ Loaded {len(self.samples)} training samples.")
         print("-------------------------------------------\n")
 
     def __len__(self):
-        return len(self.indices)
+        return len(self.samples)
 
     def __getitem__(self, idx):
-        offset, contra_idx = self.indices[idx]
-        
-        try:
-            with open(self.data_path, 'rb') as f:
-                f.seek(offset)
-                line_bytes = f.readline()
-
-            line_str = line_bytes.decode('utf-8')
-            row_values = next(csv.reader([line_str]))
-            
-            # Extract fields
-            claim = row_values[self.col_map['claim']]
-            paraphrase = row_values[self.col_map['paraphrase']]
-            
-            # Get the SPECIFIC contradiction for this sample
-            contradictions = json.loads(row_values[self.col_map['contradictions']])
-            target_contradiction = contradictions[contra_idx]
-
-            return {
-                'anchor': claim,
-                'positive': target_contradiction, # The specific Type A or Type B
-                'negative': paraphrase
-            }
-
-        except Exception as e:
-            print(f"[WARN] Error loading index {idx}: {e}")
-            return None
+        return self.samples[idx]
 
 def collate_fn(batch):
+    # Filter Nones just in case
     batch = [item for item in batch if item is not None]
     if not batch:
         return {}
@@ -154,7 +102,7 @@ def collate_fn(batch):
     }
 
 # ==========================================
-# 3. Model & Loss (Standard Hoyer)
+# 3. Model & Loss (Optimized)
 # ==========================================
 class HoyerSparsityLoss(nn.Module):
     def __init__(self, temperature=0.05):
@@ -163,7 +111,12 @@ class HoyerSparsityLoss(nn.Module):
         self.epsilon = 1e-8
 
     def forward(self, anchor_emb, pos_emb, neg_emb):
-        # Calculate Hoyer matrix elements for Positive pairs
+        # anchor: [B, D], pos: [B, D], neg: [B, D]
+        
+        # We need to broadcast to compute pairwise differences in the batch
+        # A: [B, 1, D]
+        # P: [1, B, D]
+        # N: [1, B, D]
         a_ex = anchor_emb.unsqueeze(1)
         p_ex = pos_emb.unsqueeze(0)
         n_ex = neg_emb.unsqueeze(0)
@@ -171,36 +124,62 @@ class HoyerSparsityLoss(nn.Module):
         d = anchor_emb.shape[1]
         sqrt_d = np.sqrt(d)
 
-        # Diff Positive
-        diff_pos = a_ex - p_ex
-        l1_pos = torch.norm(diff_pos, p=1, dim=2)
-        l2_pos = torch.norm(diff_pos, p=2, dim=2) + self.epsilon
-        matrix_pos = (sqrt_d - (l1_pos/l2_pos)) / (sqrt_d - 1)
+        # Helper to compute Hoyer Score matrix
+        def compute_hoyer_matrix(expanded_anchor, expanded_target):
+            # Diff: [B, B, D]
+            diff = expanded_anchor - expanded_target
+            l1 = torch.norm(diff, p=1, dim=2)
+            l2 = torch.norm(diff, p=2, dim=2) + self.epsilon
+            # Hoyer Formula: (sqrt(d) - l1/l2) / (sqrt(d) - 1)
+            return (sqrt_d - (l1/l2)) / (sqrt_d - 1)
 
-        # Diff Negative
-        diff_neg = a_ex - n_ex
-        l1_neg = torch.norm(diff_neg, p=1, dim=2)
-        l2_neg = torch.norm(diff_neg, p=2, dim=2) + self.epsilon
-        matrix_neg = (sqrt_d - (l1_neg/l2_neg)) / (sqrt_d - 1)
+        # 1. Compute Hoyer Scores
+        # matrix_pos[i, j] = Hoyer(Anchor_i, Positive_j)
+        matrix_pos = compute_hoyer_matrix(a_ex, p_ex)
         
-        # Contrastive LogSumExp
-        numerator = torch.exp(torch.diag(matrix_pos) / self.temperature)
+        # matrix_neg[i, j] = Hoyer(Anchor_i, Negative_j)
+        matrix_neg = compute_hoyer_matrix(a_ex, n_ex)
+        
+        # 2. Contrastive Loss (InfoNCE)
+        # We want to MAXIMIZE the Diagonal of matrix_pos (Anchor_i vs Positive_i)
+        
+        # Numerator: exp(Hoyer(A_i, P_i) / T)
+        # We extract the diagonal for the numerator
+        pos_diag = torch.diag(matrix_pos)
+        numerator = torch.exp(pos_diag / self.temperature)
+        
+        # Denominator: Sum of exps of ALL pairs (Positives + Negatives)
+        # This treats other batch items as "In-Batch Negatives"
         denom_pos = torch.sum(torch.exp(matrix_pos / self.temperature), dim=1)
         denom_neg = torch.sum(torch.exp(matrix_neg / self.temperature), dim=1)
         
+        # Standard LogSoftmax form
         loss = -torch.log(numerator / (denom_pos + denom_neg))
+        
         return loss.mean()
 
 class SentenceEncoder(nn.Module):
     def __init__(self, model_name):
         super(SentenceEncoder, self).__init__()
         self.model = AutoModel.from_pretrained(model_name)
+
     def forward(self, input_ids, attention_mask):
         outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
-        # Mean pooling is often better for BGE than CLS, but CLS is fine too. 
-        # Using CLS token here as per your previous code.
-        cls_emb = outputs.last_hidden_state[:, 0, :]
-        return F.normalize(cls_emb, p=2, dim=1)
+        
+        # 1. Get token embeddings
+        token_embeddings = outputs.last_hidden_state # [Batch, SeqLen, Dim]
+        
+        # 2. Create mask for Mean Pooling (exclude padding tokens)
+        input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+        
+        # 3. Sum and Divide
+        sum_embeddings = torch.sum(token_embeddings * input_mask_expanded, 1)
+        sum_mask = torch.clamp(input_mask_expanded.sum(1), min=1e-9)
+        
+        mean_emb = sum_embeddings / sum_mask
+        
+        # 4. Normalize (Critical for Cosine Similarity later)
+        return F.normalize(mean_emb, p=2, dim=1)
 
 # ==========================================
 # 4. Training Loop
@@ -228,17 +207,14 @@ def load_checkpoint(model, optimizer):
 def train():
     set_seed(Config.SEED)
     
-    # Init Tokenizer
     tokenizer = AutoTokenizer.from_pretrained(Config.MODEL_NAME)
-    
-    # Init Model
     model = SentenceEncoder(Config.MODEL_NAME).to(Config.DEVICE)
     
-    # Init Dataset (Exploded)
+    # Init Dataset
     try:
         dataset = ExplodedCSVDataset(Config.DATA_PATH)
     except Exception as e:
-        print(f"Dataset Init Fatal Error: {e}")
+        print(f"Fatal Error loading data: {e}")
         return
 
     dataloader = DataLoader(dataset, batch_size=Config.BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
@@ -250,14 +226,12 @@ def train():
     current_loss_val = 0.0 
     
     print(f"Starting training on {Config.DEVICE}...")
-    print(f"Total Samples: {len(dataset)} | Batches per Epoch: {len(dataloader)}")
     model.train()
     
     for epoch in range(start_epoch, Config.EPOCHS):
         loop = tqdm(dataloader, desc=f"Epoch {epoch+1}/{Config.EPOCHS}")
         
         for batch_idx, batch in enumerate(loop):
-            # Resume logic
             if epoch == start_epoch and batch_idx < start_step:
                 continue
             
@@ -284,11 +258,9 @@ def train():
             current_loss_val = loss.item()
             loop.set_postfix(loss=f"{current_loss_val:.4f}")
             
-            # Save Checkpoint
             if batch_idx > 0 and batch_idx % Config.SAVE_STEPS == 0:
                 save_checkpoint(model, optimizer, epoch, batch_idx, current_loss_val)
 
-        # End of Epoch
         start_step = 0
         save_checkpoint(model, optimizer, epoch + 1, 0, current_loss_val)
         print(f"Epoch {epoch+1} completed.")
