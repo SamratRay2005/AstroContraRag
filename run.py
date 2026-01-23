@@ -1,304 +1,383 @@
+#!/usr/bin/env python3
+"""
+Retrieval + Contradiction Reranker (CSV Hotfix Version)
+
+Key behavior:
+- Use a SentenceTransformer (E) for retrieval + FAISS (title/abstract indices).
+- Use SparseCL checkpoint (Es) for Hoyer sparsity.
+- Rerank top-K candidates by: final_score = cos_E(query, doc) + ALPHA * Hoyer_Es(query, doc)
+- FIX: Loads 'train.csv.gz' directly to access abstracts (bypassing broken parquet).
+- FIX: Deduplicates candidates based on title.
+"""
+
+import os
+import sys
+import math
 import faiss
-import pandas as pd
+import json
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModel
 from sentence_transformers import SentenceTransformer
-import sys
-import os
-import math
+from tqdm import tqdm
 
-# --- Configuration ---
-# 1. File Paths
-TITLE_INDEX_PATH = 'arxiv_title_index.bin'
-ABSTRACT_INDEX_PATH = 'arxiv_abstract_index.bin'
-METADATA_PATH = 'arxiv_metadata.parquet'
-SPARSE_CHECKPOINT = 'sparsecl_checkpoint.pth'
+# -----------------------
+# Config
+# -----------------------
+TITLE_INDEX_PATH = "arxiv_title_index.bin"
+ABSTRACT_INDEX_PATH = "arxiv_abstract_index.bin"
+SPARSE_CHECKPOINT = "sparsecl_checkpoint.pth"
 
-# 2. Models
-RETRIEVAL_MODEL_NAME = "BAAI/bge-base-en-v1.5"
-LLM_MODEL_NAME = "mistralai/Mistral-7B-Instruct-v0.1"
+# CHANGED: Point to the original CSV instead of the broken parquet
+DATA_FILE_PATH = "train.csv.gz" 
 
-# 3. Search Settings
-TOP_K_CANDIDATES = 500 
-TITLE_THRESHOLD = 0.57     
-ABSTRACT_THRESHOLD = 0.71
+# optional precomputed embeddings (recommended)
+E_CORPUS_PATH = "E_corpus.npy"    
+ES_CORPUS_PATH = "Es_corpus.npy" 
 
-# 4. Contradiction Hyperparameters (FROM YOUR FINDINGS)
-ALPHA = 5.88454 
+RETRIEVAL_MODEL_NAME = "BAAI/bge-base-en-v1.5"   
+LLM_MODEL_NAME = "mistralai/Mistral-7B-Instruct-v0.1" 
 
-# 5. Instructions
+TOP_K_CANDIDATES = 500
+ALPHA = 5.88454
 QUERY_INSTRUCTION = "Represent this sentence for searching relevant passages: "
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+TITLE_THRESHOLD = 0.57
+ABSTRACT_THRESHOLD = 0.71
 EPS = 1e-8
 
-# ==========================================
-# SparseCL Model Definitions
-# ==========================================
-class SentenceEncoder(nn.Module):
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+USE_FP16 = True if DEVICE.type == "cuda" else False
+
+# -----------------------
+# Utilities & Models
+# -----------------------
+class SparseSentenceEncoder(nn.Module):
     def __init__(self, model_name):
         super().__init__()
         self.model = AutoModel.from_pretrained(model_name)
     def forward(self, input_ids, attention_mask):
-        outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
-        cls = outputs.last_hidden_state[:, 0, :]
+        out = self.model(input_ids=input_ids, attention_mask=attention_mask)
+        cls = out.last_hidden_state[:, 0, :]
         return F.normalize(cls, p=2, dim=1)
 
-def calculate_hoyer_vector(emb_a, emb_b):
+def calculate_hoyer_vector(emb_a: torch.Tensor, emb_b: torch.Tensor):
     diff = emb_a - emb_b
     d = diff.shape[1]
-    
     l1 = torch.norm(diff, p=1, dim=1)
     l2 = torch.norm(diff, p=2, dim=1) + EPS
-    
     sqrt_d = math.sqrt(d)
     hoyer = (sqrt_d - (l1 / l2)) / (sqrt_d - 1.0)
     return torch.clamp(hoyer, 0.0, 1.0)
 
-# ==========================================
-# LLM Wrapper
-# ==========================================
+# -----------------------
+# LLM wrapper
+# -----------------------
 class MistralResponder:
     def __init__(self):
-        print(f"Loading LLM: {LLM_MODEL_NAME}...")
+        self.model = None
         try:
+            print("Loading Mistral tokenizer+model (this may be heavy)...")
             self.tokenizer = AutoTokenizer.from_pretrained(LLM_MODEL_NAME)
             self.model = AutoModelForCausalLM.from_pretrained(
-                LLM_MODEL_NAME, 
-                torch_dtype=torch.float16, 
-                device_map="auto"
+                LLM_MODEL_NAME,
+                dtype=torch.float16 if USE_FP16 else torch.float32,
+                device_map="auto" if torch.cuda.is_available() else None
             )
         except Exception as e:
-            print(f"⚠️ Warning: Could not load Mistral ({e}). LLM features will be disabled.")
+            print(f"Warning: Could not load LLM ({e}). Skipping LLM features.")
             self.model = None
+            self.tokenizer = None
 
-    def generate_response(self, user_query, best_context, contra_context):
-        if not self.model:
-            return "LLM not loaded."
-
-        prompt = f"""[INST] You are an expert Astronomy research assistant. 
+    def generate_response(self, user_query, best_context, contra_context, max_new_tokens=256):
+        if self.model is None:
+            return "LLM not available."
+        prompt = f"""[INST] You are an expert assistant.
 User Query: "{user_query}"
 
-I have retrieved two relevant scientific contexts for you.
-1. The Best Match (Consensus View):
+Best Match (consensus):
 {best_context}
 
-2. A Contradictory or Alternative View found in the literature:
+Contradictory / Alternative:
 {contra_context}
 
-Task: Answer the user's query comprehensively. 
-- First, explain the consensus view based on the Best Match.
-- Second, explicitly highlight the contradiction or alternative methodology found in the second context.
-- Discuss why this contradiction might exist (e.g., different simulation methods, data sources, or theoretical assumptions).
+Provide a clear answer that:
+- Summarizes consensus
+- Explains the contradiction and why it might exist
+- Gives final takeaway
 [/INST]"""
-        
         inputs = self.tokenizer(prompt, return_tensors="pt").to(DEVICE)
-        
         with torch.no_grad():
             outputs = self.model.generate(
-                **inputs, 
-                max_new_tokens=512, 
-                do_sample=True, 
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=True,
                 temperature=0.7,
-                top_p=0.9
+                top_p=0.9,
+                pad_token_id=self.tokenizer.eos_token_id
             )
-        
-        response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-        if "[/INST]" in response:
-            return response.split("[/INST]")[-1].strip()
-        return response
+        text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+        if "[/INST]" in text:
+            return text.split("[/INST]")[-1].strip()
+        return text
 
-# ==========================================
-# Main Logic
-# ==========================================
+# -----------------------
+# Loading resources
+# -----------------------
 def load_resources():
-    print("Loading Retrieval Resources...")
-    try:
-        # Load Indices
-        idx_title = faiss.read_index(TITLE_INDEX_PATH)
-        idx_abstract = faiss.read_index(ABSTRACT_INDEX_PATH)
-        df = pd.read_parquet(METADATA_PATH)
-        
-        # Load Standard BGE Model (for Retrieval)
-        retrieval_model = SentenceTransformer(RETRIEVAL_MODEL_NAME)
-        
-        # Load SparseCL Model (for Contradiction Scoring)
-        print(f"Loading SparseCL Checkpoint: {SPARSE_CHECKPOINT}")
-        sparse_model = SentenceEncoder(RETRIEVAL_MODEL_NAME).to(DEVICE)
-        
-        if os.path.exists(SPARSE_CHECKPOINT):
-            ckpt = torch.load(SPARSE_CHECKPOINT, map_location=DEVICE)
-            # Handle potential DataParallel wrapping or state_dict nesting
-            if 'model_state_dict' in ckpt:
-                state_dict = ckpt['model_state_dict']
-            else:
-                state_dict = ckpt
-            
-            new_state = {k.replace("module.", ""): v for k, v in state_dict.items()}
-            sparse_model.load_state_dict(new_state)
-            sparse_model.eval()
-        else:
-            print("❌ Error: SparseCL checkpoint not found!")
-            sys.exit(1)
-            
-        # Load Tokenizer for SparseCL (same as BGE)
-        sparse_tokenizer = AutoTokenizer.from_pretrained(RETRIEVAL_MODEL_NAME)
-        
-        # Load LLM
-        llm = MistralResponder()
-        
-        return idx_title, idx_abstract, df, retrieval_model, sparse_model, sparse_tokenizer, llm
-    except Exception as e:
-        print(f"Error loading resources: {e}")
-        sys.exit(1)
+    print("Loading FAISS indices...")
+    if not os.path.exists(TITLE_INDEX_PATH) or not os.path.exists(ABSTRACT_INDEX_PATH):
+        raise FileNotFoundError("Missing FAISS index files.")
+    idx_title = faiss.read_index(TITLE_INDEX_PATH)
+    idx_abstract = faiss.read_index(ABSTRACT_INDEX_PATH)
 
-def query_index(index, query_vector, k, threshold):
-    D, I = index.search(query_vector, k)
+    # ---------------------------------------------------------
+    # UPDATED: Load CSV directly (Slow but complete)
+    # ---------------------------------------------------------
+    print(f"Loading metadata from {DATA_FILE_PATH} (this might take a moment)...")
+    if not os.path.exists(DATA_FILE_PATH):
+         raise FileNotFoundError(f"Missing data file: {DATA_FILE_PATH}")
+    
+    # We must replicate the load logic from encode.py to ensure indices match
+    df = pd.read_csv(
+        DATA_FILE_PATH, 
+        compression='gzip', 
+        usecols=['arxiv_id', 'title', 'abstract', 'authors'],
+        dtype={'arxiv_id': str} 
+    )
+    df.fillna("", inplace=True)
+    # ---------------------------------------------------------
+
+    print("Loading retrieval model (SentenceTransformer)...")
+    retrieval_model = SentenceTransformer(RETRIEVAL_MODEL_NAME)
+
+    print("Loading sparse model (SparseCL checkpoint)...")
+    sparse_model = SparseSentenceEncoder(RETRIEVAL_MODEL_NAME).to(DEVICE)
+    if os.path.exists(SPARSE_CHECKPOINT):
+        try:
+            ckpt = torch.load(SPARSE_CHECKPOINT, map_location=DEVICE, weights_only=True)
+        except:
+            ckpt = torch.load(SPARSE_CHECKPOINT, map_location=DEVICE, weights_only=False)
+        state = ckpt['model_state_dict'] if 'model_state_dict' in ckpt else ckpt
+        state = {k.replace("module.", ""): v for k, v in state.items()}
+        sparse_model.load_state_dict(state, strict=False)
+    else:
+        raise FileNotFoundError("SparseCL checkpoint not found.")
+    sparse_model.eval()
+
+    sparse_tokenizer = AutoTokenizer.from_pretrained(RETRIEVAL_MODEL_NAME)
+
+    E_corpus = None
+    Es_corpus = None
+    if os.path.exists(E_CORPUS_PATH):
+        print(f"Loading precomputed dense embeddings: {E_CORPUS_PATH}")
+        E_corpus = np.load(E_CORPUS_PATH, mmap_mode="r")
+    if os.path.exists(ES_CORPUS_PATH):
+        print(f"Loading precomputed sparse embeddings: {ES_CORPUS_PATH}")
+        Es_corpus = np.load(ES_CORPUS_PATH, mmap_mode="r")
+
+    llm = None
+    try:
+        llm = MistralResponder()
+    except Exception:
+        llm = None
+
+    return idx_title, idx_abstract, df, retrieval_model, sparse_model, sparse_tokenizer, E_corpus, Es_corpus, llm
+
+# -----------------------
+# Helpers
+# -----------------------
+def query_index(index, query_vector_np: np.ndarray, k: int, threshold: float):
+    D, I = index.search(query_vector_np.astype(np.float32), k)
     matches = {}
     for score, idx in zip(D[0], I[0]):
-        if idx == -1: continue 
+        if idx == -1: continue
         if score >= threshold:
-            matches[idx] = score
+            matches[int(idx)] = float(score)
     return matches
 
-def get_contradiction_candidate(sparse_model, tokenizer, best_text, candidate_texts, candidate_indices):
-    """
-    Computes Score = Cosine + Alpha * Hoyer.
-    Returns the index with the HIGHEST score (Highest Likelihood of Contradiction).
-    """
-    if not candidate_texts:
-        return None, 0.0
+@torch.inference_mode()
+def compute_sparse_embeddings_for_texts(texts, tokenizer, sparse_model, batch_size=64):
+    all_embs = []
+    for i in range(0, len(texts), batch_size):
+        chunk = texts[i:i+batch_size]
+        inp = tokenizer(chunk, padding=True, truncation=True, return_tensors="pt", max_length=256).to(DEVICE)
+        emb = sparse_model(inp['input_ids'], inp['attention_mask'])
+        all_embs.append(emb.cpu().numpy())
+    return np.vstack(all_embs)
 
-    # Prepare inputs
-    all_texts = [best_text] + candidate_texts
-    
-    # Tokenize
-    inputs = tokenizer(all_texts, padding=True, truncation=True, max_length=128, return_tensors='pt').to(DEVICE)
-    
-    with torch.no_grad():
-        embeddings = sparse_model(inputs['input_ids'], inputs['attention_mask'])
-    
-    best_emb = embeddings[0].unsqueeze(0) # Shape [1, D]
-    cand_embs = embeddings[1:]            # Shape [N, D]
-    
-    # 1. Cosine Similarity
-    cos_sims = torch.mm(cand_embs, best_emb.T).squeeze(1) # Shape [N]
-    
-    # 2. Hoyer Vector Calculation
-    best_emb_expanded = best_emb.expand_as(cand_embs)
-    hoyer_scores = calculate_hoyer_vector(cand_embs, best_emb_expanded) # Shape [N]
-    
-    # 3. Combined Score (Using your Optimal Alpha 5.88)
-    # We maximize this score to find the contradiction
-    final_scores = cos_sims + ALPHA * hoyer_scores
-    
-    # Find Index of MAXIMUM score
-    max_val, max_idx_tensor = torch.max(final_scores, dim=0)
-    max_idx = max_idx_tensor.item()
-    
-    best_contradiction_idx = candidate_indices[max_idx]
-    return best_contradiction_idx, max_val.item()
+# -----------------------
+# Rerank
+# -----------------------
+def rerank_topk_and_find_contradiction(
+    query_text, best_idx, best_source,
+    candidate_indices, candidate_texts,
+    retrieval_model, sparse_model, sparse_tokenizer,
+    E_corpus=None, Es_corpus=None, alpha=ALPHA, device=DEVICE
+):
+    k = len(candidate_indices)
+    if k == 0:
+        return None, None, {}
 
+    # 1) Dense cosine
+    full_query = QUERY_INSTRUCTION + query_text
+    E_query = retrieval_model.encode([full_query], normalize_embeddings=True)
+
+    if E_corpus is not None:
+        E_topk = np.asarray(E_corpus[candidate_indices])
+        cos_scores = (E_topk @ E_query.T).squeeze(1)
+    else:
+        dense_chunks = []
+        batch = 64
+        for i in range(0, k, batch):
+            batch_texts = candidate_texts[i:i+batch]
+            enc = retrieval_model.encode(batch_texts, normalize_embeddings=True)
+            dense_chunks.append(enc)
+        Ek = np.vstack(dense_chunks)
+        cos_scores = (Ek @ E_query.T).squeeze(1)
+
+    # 2) Hoyer sparsity
+    if Es_corpus is not None:
+        Es_topk = np.asarray(Es_corpus[candidate_indices])
+        inputs = sparse_tokenizer([full_query], padding=True, truncation=True, return_tensors="pt", max_length=256).to(device)
+        with torch.no_grad():
+            Es_query = sparse_model(inputs['input_ids'], inputs['attention_mask']).cpu().numpy()
+        Es_topk_t = torch.from_numpy(Es_topk).to(device).float()
+        Es_query_t = torch.from_numpy(Es_query).to(device).float()
+        hoyer_scores = calculate_hoyer_vector(Es_topk_t, Es_query_t.expand_as(Es_topk_t)).cpu().numpy()
+    else:
+        Es_topk = compute_sparse_embeddings_for_texts(candidate_texts, sparse_tokenizer, sparse_model, batch_size=64)
+        inputs = sparse_tokenizer([full_query], padding=True, truncation=True, return_tensors="pt", max_length=256).to(device)
+        with torch.no_grad():
+            Es_query = sparse_model(inputs['input_ids'], inputs['attention_mask']).cpu().numpy()
+        Es_topk_t = torch.from_numpy(Es_topk).to(device).float()
+        Es_query_t = torch.from_numpy(Es_query).to(device).float()
+        hoyer_scores = calculate_hoyer_vector(Es_topk_t, Es_query_t.expand_as(Es_topk_t)).cpu().numpy()
+
+    # 3) Combine
+    final_scores = cos_scores + alpha * hoyer_scores
+
+    best_local = int(np.argmax(final_scores))
+    best_global_idx = candidate_indices[best_local]
+    best_score = float(final_scores[best_local])
+
+    details = {
+        "cos_scores": cos_scores,
+        "hoyer_scores": hoyer_scores,
+        "final_scores": final_scores,
+        "best_local_index": best_local
+    }
+    return best_global_idx, best_score, details
+
+# -----------------------
+# Main
+# -----------------------
 def main():
-    idx_title, idx_abstract, df, bge_model, sparse_model, sparse_tok, llm = load_resources()
+    print("Starting retrieval system (Using CSV directly)...")
+    idx_title, idx_abstract, df, retrieval_model, sparse_model, sparse_tokenizer, E_corpus, Es_corpus, llm = load_resources()
+    print("Ready. Enter a query (type 'exit' to quit).")
 
-    print("\n=======================================================")
-    print(f"   ASTRONOMY CONTRADICTION RETRIEVAL SYSTEM")
-    print(f"   Alpha: {ALPHA} | Accuracy Exp: ~97.8%")
-    print("=======================================================\n")
-    
     while True:
-        query_text = input("\nEnter Query: ").strip()
-        if query_text.lower() in ['exit', 'quit']:
+        q = input("\nQuery> ").strip()
+        if q.lower() in ["exit", "quit"]:
             break
-        if not query_text:
+        if not q:
             continue
 
-        # 1. BGE Retrieval
-        full_query = QUERY_INSTRUCTION + query_text
-        query_vec = bge_model.encode([full_query], normalize_embeddings=True)
-        
-        # Search both indices
-        title_scores = query_index(idx_title, query_vec, TOP_K_CANDIDATES, TITLE_THRESHOLD)
-        abstract_scores = query_index(idx_abstract, query_vec, TOP_K_CANDIDATES, ABSTRACT_THRESHOLD)
-        
-        all_indices = set(title_scores.keys()) | set(abstract_scores.keys())
-        
+        # 1) Search
+        full_query = QUERY_INSTRUCTION + q
+        q_vec = retrieval_model.encode([full_query], normalize_embeddings=True).astype(np.float32)
+
+        title_matches = query_index(idx_title, q_vec, TOP_K_CANDIDATES, TITLE_THRESHOLD)
+        abs_matches = query_index(idx_abstract, q_vec, TOP_K_CANDIDATES, ABSTRACT_THRESHOLD)
+
+        all_indices = set(title_matches.keys()) | set(abs_matches.keys())
         if not all_indices:
-            print("No results found above thresholds.")
+            print("No candidates above thresholds.")
             continue
-        
-        # 2. Identify Best Match (Standard BGE Score)
+
         scored_results = []
         for idx in all_indices:
-            s_title = title_scores.get(idx, -1.0)
-            s_abs = abstract_scores.get(idx, -1.0)
-            
-            # Prefer Title match if scores are close, otherwise take max
-            if s_title > s_abs:
-                scored_results.append((idx, s_title, 'title'))
+            s_t = title_matches.get(idx, -1.0)
+            s_a = abs_matches.get(idx, -1.0)
+            if s_t > s_a:
+                scored_results.append((idx, s_t, "title"))
             else:
-                scored_results.append((idx, s_abs, 'abstract'))
-        
-        # Sort desc by BGE score
+                scored_results.append((idx, s_a, "abstract"))
         scored_results.sort(key=lambda x: x[1], reverse=True)
-        
-        best_match = scored_results[0]
-        best_idx = best_match[0]
-        best_score = best_match[1]
-        best_source = best_match[2] # 'title' or 'abstract'
-        
-        best_row = df.iloc[best_idx]
-        best_text_display = f"Title: {best_row.get('title', '')}\nAbstract: {best_row.get('abstract', '')}"
-        
-        # This is the text used for sparse comparison (title vs title OR abstract vs abstract)
-        best_comp_text = str(best_row['title']) if best_source == 'title' else str(best_row['abstract'])
 
-        print(f"\n✅ [Best Match] ID: {best_idx} | BGE Score: {best_score:.4f}")
-        print(f"Title: {best_row.get('title', 'N/A')}")
+        # 2) Best Match
+        best_idx, best_score, best_source = scored_results[0]
+        row = df.iloc[int(best_idx)]
+        
+        # Now we can safely access 'abstract' because we loaded the full CSV
+        best_text_display = f"Title: {row.get('title','')}\nAbstract: {row.get('abstract','')}"
+        best_comp_text = str(row['title']) if best_source == 'title' else str(row['abstract'])
+        
+        # Clean the title for deduplication
+        best_title_clean = str(row.get('title', '')).strip().lower()
 
-        # 3. Identify Contradictory Result
+        print(f"\n[Best Match] ID={best_idx} score={best_score:.4f} source={best_source}")
+        print("  ", str(row.get("title", ""))[:200].replace("\n", " "))
+
+        # 3) Deduplication & Candidate Collection
         candidate_indices = []
         candidate_texts = []
         
-        # Collect candidates (skip best match)
-        for res in scored_results[1:]: 
-            idx = res[0]
-            row = df.iloc[idx]
-            # Enforce Domain Isolation: Compare Title-to-Title or Abstract-to-Abstract
-            text = str(row['title']) if best_source == 'title' else str(row['abstract'])
+        for idx_tuple in scored_results[1:]:
+            idx = int(idx_tuple[0])
+            r = df.iloc[idx]
             
+            curr_title = str(r.get('title', ''))
+            curr_title_clean = curr_title.strip().lower()
+            
+            # Deduplicate
+            if curr_title_clean == best_title_clean:
+                continue
+            
+            # Text for comparison
             candidate_indices.append(idx)
-            candidate_texts.append(text)
+            candidate_texts.append(str(r['title']) if best_source == 'title' else str(r['abstract']))
             
+            if len(candidate_indices) >= TOP_K_CANDIDATES:
+                break
+
+        # 4) Rerank
         if not candidate_indices:
-            print("Not enough candidates for contradiction search.")
+            print("No candidates to rerank.")
+            contra_idx, contra_score, details = None, None, {}
+        else:
+            print(f"Reranking {len(candidate_indices)} candidates...")
+            contra_idx, contra_score, details = rerank_topk_and_find_contradiction(
+                best_comp_text, best_idx, best_source,
+                candidate_indices, candidate_texts,
+                retrieval_model, sparse_model, sparse_tokenizer,
+                E_corpus=E_corpus, Es_corpus=Es_corpus, alpha=ALPHA, device=DEVICE
+            )
+
+        if contra_idx is None:
+            print("No contradiction found.")
             contra_text_display = "No contradiction found."
         else:
-            print(f"🔍 Scanning {len(candidate_indices)} candidates for contradictions...")
+            r2 = df.iloc[int(contra_idx)]
+            t2_text = str(r2.get('title', ''))
+            a2_text = str(r2.get('abstract', ''))
+            contra_text_display = f"Title: {t2_text}\nAbstract: {a2_text}"
             
-            contra_idx, contra_score = get_contradiction_candidate(
-                sparse_model, sparse_tok, 
-                best_comp_text, candidate_texts, candidate_indices
-            )
-            
-            contra_row = df.iloc[contra_idx]
-            contra_text_display = f"Title: {contra_row.get('title', '')}\nAbstract: {contra_row.get('abstract', '')}"
-            
-            print(f"\n❌ [Contradiction Found] ID: {contra_idx} | SparseCL Score: {contra_score:.4f}")
-            print(f"Title: {contra_row.get('title', 'N/A')}")
+            print(f"[Contradiction] ID={contra_idx} score={contra_score:.4f}")
+            print("  ", t2_text[:200].replace("\n", " "))
 
-        # 4. Generate LLM Response
-        print("\n🤖 Generating Mistral Analysis...")
-        answer = llm.generate_response(query_text, best_text_display, contra_text_display)
-        
-        print("\n" + "="*80)
-        print("MISTRAL ANSWER:")
-        print("="*80)
-        print(answer)
-        print("-" * 80)
+        # 5) LLM
+        if llm is not None and llm.model is not None:
+            print("\nGenerating LLM answer (may take time)...")
+            answer = llm.generate_response(q, best_text_display, contra_text_display)
+            print("\n=== LLM ANSWER ===\n")
+            print(answer)
+            print("\n==================\n")
+        else:
+            print("\nLLM not available or not loaded. Skipping LLM step.")
 
 if __name__ == "__main__":
     main()
