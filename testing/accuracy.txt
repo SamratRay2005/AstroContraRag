@@ -1,0 +1,11 @@
+:- python accuracy.py    
+==============================
+STATUS REPORT
+==============================
+Total Rows in File:      718
+Rows Processed:          718
+Rows Pending:            0
+------------------------------
+Contradictions Found (Y): 616
+Current Accuracy:         85.79%
+==============================
