@@ -8,6 +8,7 @@ Key behavior:
 - Rerank top-K candidates by: final_score = cos_E(query, doc) + ALPHA * Hoyer_Es(query, doc)
 - FIX: Loads 'train.csv.gz' directly to access abstracts (bypassing broken parquet).
 - FIX: Deduplicates candidates based on title.
+- UPDATE: Optimized LLM prompt with strict guardrails and source attribution.
 """
 
 import os
@@ -41,7 +42,7 @@ ES_CORPUS_PATH = "Es_corpus.npy"
 RETRIEVAL_MODEL_NAME = "BAAI/bge-base-en-v1.5"   
 LLM_MODEL_NAME = "mistralai/Mistral-7B-Instruct-v0.1" 
 
-TOP_K_CANDIDATES = 500
+TOP_K_CANDIDATES = 20
 ALPHA = 5.88454
 QUERY_INSTRUCTION = "Represent this sentence for searching relevant passages: "
 TITLE_THRESHOLD = 0.57
@@ -91,30 +92,38 @@ class MistralResponder:
             self.model = None
             self.tokenizer = None
 
-    def generate_response(self, user_query, best_context, contra_context, max_new_tokens=256):
+    def generate_response(self, user_query, best_context, best_match_id, contra_context, max_new_tokens=256):
         if self.model is None:
             return "LLM not available."
-        prompt = f"""[INST] You are an expert assistant.
+        
+        # UPDATED PROMPT: Implements Labeling, Guardrails, and Attribution
+        # UPDATED PROMPT: Balanced POV for Scientific Context
+        prompt = f"""[INST] You are a scientific research assistant.
+
 User Query: "{user_query}"
 
-Best Match (consensus):
+PRIMARY_SOURCE (Source ID: {best_match_id}):
 {best_context}
 
-Contradictory / Alternative:
+COMPARATIVE_CONTEXT:
 {contra_context}
 
-Provide a clear answer that:
-- Summarizes consensus
-- Explains the contradiction and why it might exist
-- Gives final takeaway
+INSTRUCTIONS:
+1. Synthesize a response using BOTH sources to provide a complete perspective.
+2. If the sources AGREE, use the COMPARATIVE_CONTEXT to provide additional supporting data.
+3. If the sources DISAGREE (contradict), explain the difference (e.g., different methods, different objects, or conflicting results).
+4. Always cite Source ID "{best_match_id}" when referencing the primary findings.
+
+Answer:
 [/INST]"""
+        
         inputs = self.tokenizer(prompt, return_tensors="pt").to(DEVICE)
         with torch.no_grad():
             outputs = self.model.generate(
                 **inputs,
                 max_new_tokens=max_new_tokens,
                 do_sample=True,
-                temperature=0.7,
+                temperature=0.2, # Lowered temperature for stricter adherence
                 top_p=0.9,
                 pad_token_id=self.tokenizer.eos_token_id
             )
@@ -372,7 +381,10 @@ def main():
         # 5) LLM
         if llm is not None and llm.model is not None:
             print("\nGenerating LLM answer (may take time)...")
-            answer = llm.generate_response(q, best_text_display, contra_text_display)
+            
+            # UPDATED: We now pass best_idx as the ID for citation
+            answer = llm.generate_response(q, best_text_display, best_idx, contra_text_display)
+            
             print("\n=== LLM ANSWER ===\n")
             print(answer)
             print("\n==================\n")
