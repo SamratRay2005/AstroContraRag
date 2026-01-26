@@ -16,7 +16,7 @@ def get_similarity(s1, s2):
 
 def is_contradiction_too_similar(claim, contradictions_json, threshold=0.995):
     """
-    Returns True if ANY contradiction in the list is >97% similar to the claim.
+    Returns True if ANY contradiction in the list is >99.5% similar to the claim.
     """
     try:
         if pd.isna(contradictions_json) or pd.isna(claim):
@@ -31,7 +31,7 @@ def is_contradiction_too_similar(claim, contradictions_json, threshold=0.995):
             # CHECK: Calculate similarity
             score = get_similarity(claim, contra)
             
-            # If similarity is > 97% (0.97), mark this row as bad
+            # If similarity is > 99.5% (0.995), mark this row as bad
             if score > threshold:
                 return True
             
@@ -65,7 +65,7 @@ def main():
             current_len = len(df)
             total_rows += current_len
             
-            # 2. Apply the >97% similarity filter
+            # 2. Apply the >99.5% similarity filter
             # We want to KEEP rows where is_contradiction_too_similar is False
             mask = df.apply(lambda row: is_contradiction_too_similar(row.get('claim', ''), row.get('contradictions', '')), axis=1)
             df_clean = df[~mask]
