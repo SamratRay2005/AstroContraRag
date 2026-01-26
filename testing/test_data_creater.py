@@ -4,7 +4,7 @@ import random
 from io import StringIO
 
 DATA_FILE_PATH = "train.csv.gz"
-SAMPLE_SIZE = 718
+SAMPLE_SIZE = 4500
 
 print("Starting single-pass random sampling...")
 

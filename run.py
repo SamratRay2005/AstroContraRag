@@ -45,8 +45,8 @@ LLM_MODEL_NAME = "mistralai/Mistral-7B-Instruct-v0.1"
 TOP_K_CANDIDATES = 20
 ALPHA = 5.88454
 QUERY_INSTRUCTION = "Represent this sentence for searching relevant passages: "
-TITLE_THRESHOLD = 0.57
-ABSTRACT_THRESHOLD = 0.71
+TITLE_THRESHOLD = 0.53
+ABSTRACT_THRESHOLD = 0.87
 EPS = 1e-8
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")

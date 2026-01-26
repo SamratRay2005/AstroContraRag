@@ -1,4 +1,7 @@
-:- python test_sparse.py 
+### Run Log (`python test_sparse.py`)
+
+```bash
+$ python test_sparse.py
 Loading Dense Model...
 Loading Sparse Model...
 Loading checkpoint: sparsecl_checkpoint.pth
@@ -40,5 +43,4 @@ MAX ACCURACY:        97.80%
        FinalP=2.950 FinalC=2.783 (Contradiction was lower)
 
 Final Verified Count: 105569/107944
-(llama_clean) [tpant@localhost ~]$ 
-
+(llama_clean) [tpant@localhost ~]$
