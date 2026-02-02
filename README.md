@@ -120,47 +120,52 @@ ASTROCONTRARAG/
 
 ### Step 1: Data Generation
 
-Extract atomic claims and generate Type-B hard negatives using Mistral-7B.
+Extract atomic claims and generate Type-B hard negatives.
+
+> **Note:** Configuration (overlap thresholds) is managed in the `CONFIG` block at the top of `sparse/datasetmaker.py`.
 
 ```bash
-python sparse/datasetmaker.py --overlap_threshold 0.40 --coverage 0.15
+python sparse/datasetmaker.py
 ```
 
 ### Step 2: Fine-Tuning (Astro-SparseCL)
 
-Train the bi-encoder with the optimized Hoyer Sparsity Weight ($\alpha=5.88$).
+Train the bi-encoder using the Hoyer Sparsity Loss.
+
+> **Note:** Hyperparameters (Alpha=5.88, Epochs=3) are set in the `Config` class within `sparse/finetune.py`.
 
 ```bash
-python sparse/finetune.py \
-  --base_model BAAI/bge-base-en-v1.5 \
-  --alpha 5.88 \
-  --batch_size 16 \
-  --lr 2e-5 \
-  --epochs 3
+python sparse/finetune.py
 ```
 
 ### Step 3: Indexing & Retrieval
 
 Encode the corpus and build the dual FAISS indices.
 
+> **Note:** This script automatically applies the asymmetric thresholds (**0.87** for Abstracts, **0.53** for Titles).
+
 ```bash
 python Faiss/encode.py
 ```
 
-**Note:** This script applies the asymmetric thresholds found in our research: **0.87** for Abstracts (high precision) and **0.53** for Titles (high recall).
+### Step 4: Evaluation Pipeline
 
-### Step 4: Evaluation
+This is a two-stage process. First, generate the retrieval candidates, then validate them with the LLM.
 
-Run the binary LLM-as-a-Judge evaluation using Llama-3.1-8B.
-
-```bash
-python testing/evaluate_llm.py --queries 2336
-```
-
-Or evaluate with standard metrics:
+**A. Generate Candidate CSV**
+Run standard retrieval on the test set to create `intermediate_candidates.csv`.
 
 ```bash
 python testing/evaluate_csv.py
+```
+
+**B. Run LLM-as-a-Judge**
+Validate the contradictions using Llama-3.1-8B.
+
+> **Note:** This script processes the `intermediate_candidates.csv` file generated in the previous step. To limit the number of queries, modify the loop in `evaluate_llm.py` directly.
+
+```bash
+python testing/evaluate_llm.py
 ```
 
 ---
